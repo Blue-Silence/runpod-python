@@ -137,6 +137,53 @@ You can also test your worker locally before deploying it to Runpod. This is use
 python my_worker.py --rp_serve_api
 ```
 
+### Pause queue intake and dispatch (fork extension)
+
+Pass a `JobControl` to a queue-based worker to independently pause acquisition
+of new jobs and dispatch of jobs already in its local queue:
+
+```python
+from runpod.serverless import JobControl, start
+
+control = JobControl()
+
+start({
+    "handler": handler,
+    "concurrency_modifier": lambda _: 2,
+    "job_control": control,
+})
+```
+
+Application code holding `control` can call `pause_polling()` /
+`resume_polling()` and `pause_dispatch()` / `resume_dispatch()`, including from
+a timer thread. Both operations are enabled by default. Resume wakes the
+corresponding loop without waiting for the queue to empty. Keep concurrency
+positive; these controls do not change it or resize the queue.
+
+A poll already in flight may still return jobs, which are retained in the
+queue. Tasks dispatched before the pause continue running, even if they have
+not entered the user handler yet. Completion reporting, heartbeat, and job-stop
+monitoring continue. Shutdown overrides dispatch pause and drains held jobs
+using the SDK's existing behavior. Startup failure reporting may still acquire
+a job to report the error, as in the original SDK.
+
+Use one control per worker. Direct HTTP mode (`--rp_serve_api`, including local
+`/runsync`) bypasses `JobScaler` and is not gated by these controls.
+
+A handler that was dispatched before admission closed can raise
+`runpod.serverless.RequeueJob` **before doing work or yielding any output**.
+JobScaler returns the same job to the tail of its original queue, releases the
+task, and keeps progress/heartbeat tracking. No terminal result is sent for
+that attempt. Pause dispatch before rejecting admission, and resume when the
+next batch can start; otherwise the job will be dispatched again immediately.
+Raising after a stream chunk is treated as a failure, not a retry.
+
+Requeue uses `put_nowait`: running jobs still count toward intake capacity, so
+fetchers must honor the requested job count. If the queue is unexpectedly full,
+or shutdown has begun, the rejected job is failed explicitly rather than
+blocking or retrying indefinitely. A queued job can still be cancelled by the
+stop channel. Requeue does not reset cloud execution timeouts or job TTLs.
+
 ## 📁 | Directory
 
 ```BASH

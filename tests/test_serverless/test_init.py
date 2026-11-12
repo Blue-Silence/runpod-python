@@ -22,6 +22,8 @@ class TestServerlessInit:
     def test_expected_public_symbols(self):
         """Test that expected public symbols are in __all__."""
         expected_symbols = {
+            'JobControl',
+            'RequeueJob',
             'start',
             'progress_update',
             'register_fitness_check',
@@ -101,5 +103,5 @@ class TestServerlessInit:
         assert all_symbols.issubset(public_attrs), f"__all__ contains non-public symbols: {all_symbols - public_attrs}"
 
         # Expected public API should be exactly what's in __all__
-        expected_public_api = {'start', 'progress_update', 'register_fitness_check', 'register_prestart_hook', 'runpod_version', 'VolumeCache'}
+        expected_public_api = {'JobControl', 'RequeueJob', 'start', 'progress_update', 'register_fitness_check', 'register_prestart_hook', 'runpod_version', 'VolumeCache'}
         assert all_symbols == expected_public_api, f"Expected {expected_public_api}, got {all_symbols}"

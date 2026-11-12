@@ -15,6 +15,7 @@ from typing import Any
 from ..version import __version__ as runpod_version
 from . import worker
 from .modules.rp_fitness import register_fitness_check
+from .modules.rp_job_control import JobControl, RequeueJob
 from .modules.rp_logger import RunPodLogger
 from .modules.rp_prestart import has_prestart_hooks as _has_prestart_hooks
 from .modules.rp_prestart import register_prestart_hook
@@ -22,6 +23,8 @@ from .modules.rp_progress import progress_update
 from .utils.rp_volume_cache import VolumeCache
 
 __all__ = [
+    "JobControl",
+    "RequeueJob",
     "VolumeCache",
     "progress_update",
     "register_fitness_check",
@@ -171,6 +174,9 @@ def start(config: dict[str, Any]):
     config["handler"] (Callable): The handler function to run.
 
     config["rp_args"] (dict[str, Any]): Arguments populated by runtime arguments.
+
+    config["job_control"] (JobControl, optional): Pause/resume queue-based job
+        acquisition and dispatch independently. Does not gate direct API mode.
 
     Prestart hooks registered with `register_prestart_hook` run once before
     handler execution in queue-based, local test, and hosted API modes.

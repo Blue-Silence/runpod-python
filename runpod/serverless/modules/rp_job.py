@@ -19,6 +19,7 @@ from ..utils import rp_debugger
 from .rp_capture import capture, handler_capture_enabled
 from .rp_handler import is_generator
 from .rp_http import send_result, stream_result
+from .rp_job_control import RequeueJob
 from .rp_tips import check_return_size
 from .worker_state import WORKER_ID, REF_COUNT_ZERO, JobsProgress
 
@@ -149,7 +150,9 @@ async def get_job(
             return
 
         if response.status == 400:
-            log.debug("rp_job | Received 400 status, expected when FlashBoot is enabled.")
+            log.debug(
+                "rp_job | Received 400 status, expected when FlashBoot is enabled."
+            )
             return
 
         if response.status == 429:
@@ -157,7 +160,7 @@ async def get_job(
                 response.request_info,
                 response.history,
                 status=response.status,
-                message=response.reason
+                message=response.reason,
             )
 
         # All other errors should raise an exception
@@ -177,7 +180,9 @@ async def get_job(
             jobs = await response.json()
             log.debug("rp_job | Received Job(s)")
         except aiohttp.ContentTypeError:
-            log.debug(f"rp_job | Response content is not valid JSON. {response.content}")
+            log.debug(
+                f"rp_job | Response content is not valid JSON. {response.content}"
+            )
             return
         except ValueError as json_error:
             log.debug(f"rp_job | Failed to parse JSON response: {json_error}")
@@ -226,7 +231,9 @@ async def handle_job(session: ClientSession, config: Dict[str, Any], job) -> dic
         job_result["stopPod"] = True
 
     # If rp_debugger is set, debugger output will be returned.
-    if config.get("rp_args", {}).get("rp_debugger", False) and isinstance(job_result, dict):
+    if config.get("rp_args", {}).get("rp_debugger", False) and isinstance(
+        job_result, dict
+    ):
         job_result["output"]["rp_debugger"] = rp_debugger.get_debugger_output()
         log.debug("rp_debugger | Flag set, returning debugger output.", job["id"])
 
@@ -292,7 +299,11 @@ async def run_job(handler: Callable, job: Dict[str, Any]) -> Dict[str, Any]:
 
             check_return_size(run_result)  # Checks the size of the return body.
 
-        except Exception as err:  # noqa: BLE001 - user handler may raise anything; surface it
+        except RequeueJob:
+            raise
+        except (
+            Exception
+        ) as err:  # noqa: BLE001 - user handler may raise anything; surface it
             captured_logs = cap.getvalue()
             error_info = {
                 "error_type": str(type(err)),
@@ -323,6 +334,7 @@ async def run_job_generator(
     Yields output partials from the generator.
     """
     is_async_gen = inspect.isasyncgenfunction(handler)
+    output_started = False
     log.debug(
         "Using Async Generator" if is_async_gen else "Using Standard Generator",
         job["id"],
@@ -337,14 +349,22 @@ async def run_job_generator(
                 async for output_partial in job_output:
                     validate_json(output_partial, "stream chunk")
                     log.debug(f"Async Generator output: {output_partial}", job["id"])
+                    output_started = True
                     yield {"output": output_partial}
             else:
                 for output_partial in job_output:
                     validate_json(output_partial, "stream chunk")
                     log.debug(f"Generator output: {output_partial}", job["id"])
+                    output_started = True
                     yield {"output": output_partial}
 
-        except Exception as err:  # noqa: BLE001 - user handler may raise anything; surface it
+        except (
+            Exception
+        ) as err:  # noqa: BLE001 - user handler may raise anything; surface it
+            if isinstance(err, RequeueJob) and not output_started:
+                raise
+            if isinstance(err, RequeueJob):
+                err = RuntimeError("RequeueJob cannot be raised after producing output")
             captured_logs = cap.getvalue()
             log.error(err, job["id"])
             error = f"handler: {str(err)} \ntraceback: {traceback.format_exc()}"

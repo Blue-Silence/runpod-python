@@ -13,6 +13,7 @@ from typing import Any
 from ...http_client import AsyncClientSession, ClientSession, TooManyRequests
 from .rp_http import send_result
 from .rp_job import _job_stop_url, get_job, get_stop_signals, handle_job
+from .rp_job_control import JobControl, RequeueJob
 from .rp_logger import RunPodLogger, _reset_batch_id, _set_batch_id
 from .rp_prestart import (
     build_prestart_cancelled_payload,
@@ -74,6 +75,7 @@ class JobScaler:
         self._failing_acquired_request = False
         self.current_concurrency = 1
         self.config = config
+        self.job_control = config.get("job_control") or JobControl()
         self.prestart_hooks = get_prestart_hooks()
         self.job_progress = JobsProgress()  # Cache the singleton instance
 
@@ -313,12 +315,22 @@ class JobScaler:
 
         Adds jobs to the JobsQueue
         """
+        self.job_control._bind()
         while self.is_alive():
             if self._prestart_error is not None:
                 # Prestart failure is terminal for this worker. Draining requests
                 # already held by the worker is owned by run_jobs.
                 break
+            await self._wait_for_polling()
+            if not self.is_alive():
+                break
             await self.set_scale()
+
+            # Scaling may yield, allowing a pause or shutdown in the meantime.
+            if not self.is_alive():
+                break
+            if self.job_control.polling_paused:
+                continue
 
             jobs_needed = self.current_concurrency - self.current_occupancy()
             if jobs_needed <= 0:
@@ -378,30 +390,53 @@ class JobScaler:
                 # Yield control back to the event loop
                 await asyncio.sleep(0)
 
+    async def _wait_for_polling(self) -> None:
+        """Wait for intake to be enabled without blocking dispatch or shutdown."""
+        while self.is_alive():
+            self.job_control._polling_changed.clear()
+            if not self.job_control.polling_paused:
+                return
+            resumed = asyncio.create_task(self.job_control._polling_changed.wait())
+            stopping = asyncio.create_task(self._shutdown_event.wait())
+            try:
+                await asyncio.wait(
+                    {resumed, stopping}, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                resumed.cancel()
+                stopping.cancel()
+                await asyncio.gather(resumed, stopping, return_exceptions=True)
+
     async def _wait_until_drained(self) -> None:
-        """Block until no job is in progress, shutdown begins, or FULL_WAIT_SECONDS pass."""
+        """Wait for drain, an intake control change, shutdown, or FULL_WAIT_SECONDS."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + FULL_WAIT_SECONDS
         while self.is_alive():
             # Clear, then re-check: a slot freed after this point re-arms the event.
             self._slot_freed.clear()
+            self.job_control._polling_changed.clear()
             remaining = deadline - loop.time()
             # Zero concurrency has no slots to free, so wait out the bound
             # rather than return without yielding to the event loop.
             drained = self.current_occupancy() == 0 and self.current_concurrency > 0
-            if drained or remaining <= 0:
+            if drained or remaining <= 0 or self.job_control.polling_paused:
                 return
             freed = asyncio.create_task(self._slot_freed.wait())
             stopping = asyncio.create_task(self._shutdown_event.wait())
+            changed = asyncio.create_task(self.job_control._polling_changed.wait())
             try:
-                await asyncio.wait(
-                    {freed, stopping},
+                done, _ = await asyncio.wait(
+                    {freed, stopping, changed},
                     timeout=remaining,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                if changed in done:
+                    return
             finally:
                 freed.cancel()
                 stopping.cancel()
+                changed.cancel()
+                await asyncio.gather(freed, stopping, changed, return_exceptions=True)
 
     async def run_jobs(self, session: ClientSession):
         """
@@ -409,15 +444,20 @@ class JobScaler:
 
         Runs the block in an infinite loop while the worker is alive or jobs queue is not empty.
         """
+        self.job_control._bind()
         tasks: set[asyncio.Task[Any]] = set()
 
         last_task_count = 0
         while self.is_alive() or not self.jobs_queue.empty():
             # Clear before draining: a job queued after this point re-arms it.
             self._jobs_available.clear()
+            self.job_control._dispatch_changed.clear()
 
             # Fetch as many jobs as the concurrency allows
             while len(tasks) < self.current_concurrency and not self.jobs_queue.empty():
+                # Shutdown retains the existing behavior of draining held jobs.
+                if self.is_alive() and self.job_control.dispatch_paused:
+                    break
                 job = await self.jobs_queue.get()
                 # Create a new task for each job and track it by job id
                 task = asyncio.create_task(self.handle_job(session, job))
@@ -448,7 +488,7 @@ class JobScaler:
     async def _wait_for_dispatch_event(
         self, tasks: set[asyncio.Task[Any]]
     ) -> set[asyncio.Task[Any]]:
-        """Block until a job finishes, a job is queued, or shutdown begins.
+        """Wait for completion, queuing, a dispatch control change, or shutdown.
 
         Waiting on events instead of polling starts a fetched job as soon as
         it is queued; a poll interval delayed every cold start's first job.
@@ -463,6 +503,7 @@ class JobScaler:
 
         waiters = {asyncio.create_task(self._jobs_available.wait())}
         if alive:
+            waiters.add(asyncio.create_task(self.job_control._dispatch_changed.wait()))
             # Once shutting down, the set event would wake this loop instantly.
             waiters.add(asyncio.create_task(self._shutdown_event.wait()))
         try:
@@ -524,17 +565,32 @@ class JobScaler:
 
     async def stop_job(self, job_id: str) -> bool:
         """
-        Stop a single in-progress job by cancelling its running task.
+        Stop a running task or remove a held job from the queue.
 
         Args:
             job_id: The id of the job to stop.
 
         Returns:
-            True if a matching in-progress job was found and stopped,
+            True if a matching running or queued job was found and stopped,
             False otherwise.
         """
         task = self.jobs_tasks.get(job_id)
         if task is None:
+            # A requeued job has no running task. Rotate the bounded queue once,
+            # retaining FIFO order and balancing every get/put without yielding.
+            removed = False
+            for _ in range(self.jobs_queue.qsize()):
+                job = self.jobs_queue.get_nowait()
+                if job["id"] == job_id:
+                    self.job_progress.remove(job)
+                    removed = True
+                else:
+                    self.jobs_queue.put_nowait(job)
+                self.jobs_queue.task_done()
+            if removed:
+                self._slot_freed.set()
+                log.info("Stopped queued job.", job_id)
+                return True
             log.debug(f"JobScaler.stop_job | No in-progress job for {job_id}.")
             return False
 
@@ -547,6 +603,7 @@ class JobScaler:
         Process an individual job. This function is run concurrently for multiple jobs.
         """
         batch_id_token = _set_batch_id(job.get("batchId"))
+        requeued = False
         try:
             log.debug("Handling Job", job["id"])
 
@@ -572,6 +629,36 @@ class JobScaler:
                 log.info("Refresh requested, taking no more jobs.", job["id"])
                 self.kill_worker()
 
+        except RequeueJob:
+            if not self.is_alive():
+                # Shutdown drains held jobs, but must not retry a rejected job
+                # forever when the application will no longer reopen admission.
+                await send_result(
+                    session,
+                    {"error": "Worker shutting down before job admission"},
+                    job,
+                    is_stream=False,
+                )
+            else:
+                try:
+                    # Running jobs still occupy JobsProgress, so a fetcher that
+                    # respects jobs_needed leaves room to return this job.
+                    self.jobs_queue.put_nowait(job)
+                except asyncio.QueueFull:
+                    log.error(
+                        "Cannot requeue job: worker queue capacity exceeded.", job["id"]
+                    )
+                    await send_result(
+                        session,
+                        {"error": "Cannot requeue job: worker queue capacity exceeded"},
+                        job,
+                        is_stream=False,
+                    )
+                else:
+                    requeued = True
+                    self._jobs_available.set()
+                    log.info("Job requeued.", job["id"])
+
         except asyncio.CancelledError:
             log.info("Job stopped.", job["id"])
             raise  # CancelledError is a BaseException
@@ -581,11 +668,13 @@ class JobScaler:
             raise
 
         finally:
-            # Inform Queue of a task completion
+            # Finish this get. A requeue has already incremented the counter
+            # with put_nowait, so join() still waits for the final attempt.
             self.jobs_queue.task_done()
 
-            # Job is no longer in progress
-            self.job_progress.remove(job)
+            # Retain the same held job (and heartbeat entry) across attempts.
+            if not requeued:
+                self.job_progress.remove(job)
             self.jobs_tasks.pop(job["id"], None)
             self._slot_freed.set()
 
